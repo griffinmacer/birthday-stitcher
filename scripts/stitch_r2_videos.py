@@ -1,6 +1,5 @@
 import os, sys, json, csv, shlex, subprocess
 from datetime import datetime
-from urllib.parse import unquote
 from pathlib import Path
 
 import boto3
@@ -14,8 +13,8 @@ SECRET_ACCESS_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
 BUCKET = os.environ["R2_BUCKET"]
 
 # Inputs provided at workflow run time:
-PREFIX = os.getenv("R2_PREFIX", "").strip()         # e.g., "uploads/sister-40/"
-OUTPUT_KEY = os.getenv("OUTPUT_KEY", "").strip()    # e.g., "finals/sister-40/Happy40.mp4"
+PREFIX = os.getenv("R2_PREFIX", "").strip()         # e.g., "uploads/" or "uploads/sister-40/"
+OUTPUT_KEY = os.getenv("OUTPUT_KEY", "").strip()    # e.g., "finals/Happy40.mp4"
 SORT_MODE = os.getenv("SORT_MODE", "last_modified") # "manifest" | "name" | "last_modified"
 TITLE_TEXT = os.getenv("TITLE_TEXT", "").strip()    # non-empty => add an intro card
 LABEL_CLIPS = os.getenv("LABEL_CLIPS", "false").lower() == "true"  # add name label first 3s
@@ -47,29 +46,19 @@ def ffprobe_json(path):
     out = subprocess.check_output(cmd, text=True)
     return json.loads(out)
 
-def rotation_from_meta(meta):
-    rot = 0
-    streams = meta.get("streams", [])
-    v = next((s for s in streams if s.get("codec_type") == "video"), None)
-    if not v:
-        return 0
-    tags = v.get("tags", {})
-    if "rotate" in tags:
-        try:
-            return int(tags["rotate"]) % 360
-        except Exception:
-            pass
-    for sd in v.get("side_data_list", []):
-        if "rotation" in sd:
-            try:
-                return int(sd["rotation"]) % 360
-            except Exception:
-                pass
-    return 0
+def has_audio_stream(meta) -> bool:
+    for s in meta.get("streams", []):
+        if s.get("codec_type") == "audio":
+            return True
+    return False
 
 def ff_esc(text: str) -> str:
-    # Escape for ffmpeg drawtext (simple version)
-    return text.replace("\\", "\\\\").replace(":", "\\:").replace("'", r"\'").replace(",", "\\,")
+    # Escape for ffmpeg drawtext
+    return (text
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", r"\'")
+            .replace(",", "\\,"))
 
 def make_label_from_filename(name):
     base = Path(name).name
@@ -121,27 +110,22 @@ def download_to(path, key):
 
 def transcode_to_uniform(infile, outfile, label_text=""):
     """
-    Re-encode each clip to the same spec so concat is reliable:
-      - 1920x1080 canvas (keep aspect: scale & pad), yuv420p
+    Re-encode each clip to identical spec so concat is reliable:
+      - 1920x1080 canvas, keep aspect (scale & pad), yuv420p
       - 30 fps
       - H.264 (libx264) CRF 21, veryfast
       - AAC 192k, 48kHz, stereo
       - EBU R128 loudness normalization
-      - Optional drawtext label first 3s
-      - Honor rotation metadata
+      - Optional lower-third label for first 3s
+      - RELY ON FFMPEG AUTOROTATE (no manual transpose)
+      - If input has no audio, add a silent track so all clips match
     """
     meta = ffprobe_json(infile)
-    rot = rotation_from_meta(meta)
+    has_audio = has_audio_stream(meta)
 
+    # Safe scale: fit inside 1920x1080 (portrait gets pillars, landscape gets letterbox if needed)
     vf_parts = []
-    if rot == 90:
-        vf_parts.append("transpose=1")
-    elif rot == 270:
-        vf_parts.append("transpose=2")
-    elif rot == 180:
-        vf_parts.append("hflip,vflip")
-
-    vf_parts.append("scale='min(1920,iw)':'-2':force_original_aspect_ratio=decrease")
+    vf_parts.append("scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2")
     vf_parts.append("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black")
     vf_parts.append("setsar=1")
     vf_parts.append("format=yuv420p")
@@ -158,19 +142,41 @@ def transcode_to_uniform(infile, outfile, label_text=""):
 
     vf = ",".join(vf_parts)
 
-    cmd = [
-        "ffmpeg","-y","-nostdin","-i", str(infile),
-        "-vf", vf,
-        "-r","30",
-        "-c:v","libx264","-preset","veryfast","-crf","21",
-        "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
-        "-af","loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-movflags","+faststart",
-        str(outfile)
-    ]
+    if has_audio:
+        # Normal case: map video + first audio
+        cmd = [
+            "ffmpeg","-y","-nostdin","-i", str(infile),
+            "-map","0:v:0","-map","0:a:0?",
+            "-vf", vf,
+            "-r","30",
+            "-c:v","libx264","-preset","veryfast","-crf","21",
+            "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
+            "-af","loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-metadata:s:v:0","rotate=0",
+            "-movflags","+faststart",
+            str(outfile)
+        ]
+    else:
+        # Add silent stereo audio so stream layout matches other clips
+        cmd = [
+            "ffmpeg","-y","-nostdin",
+            "-i", str(infile),
+            "-f","lavfi","-i","anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-shortest",
+            "-map","0:v:0","-map","1:a:0",
+            "-vf", vf,
+            "-r","30",
+            "-c:v","libx264","-preset","veryfast","-crf","21",
+            "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
+            "-af","loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-metadata:s:v:0","rotate=0",
+            "-movflags","+faststart",
+            str(outfile)
+        ]
     run(cmd)
 
 def make_title_card(outfile, text):
+    # 3-second black card with centered big text + SILENT AUDIO so concat keeps audio streams
     font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     safe = ff_esc(text)
     vf = (
@@ -179,10 +185,17 @@ def make_title_card(outfile, text):
         f"fontsize=84:fontcolor=white:box=1:boxcolor=black@0.35:boxborderw=35"
     )
     cmd = [
-        "ffmpeg","-y","-f","lavfi","-i","color=c=black:s=1920x1080:d=3",
+        # video source (3s black)
+        "ffmpeg","-y",
+        "-f","lavfi","-i","color=c=black:s=1920x1080:r=30:d=3",
+        # audio source (3s silence)
+        "-f","lavfi","-i","anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-t","3","-shortest",
+        "-map","0:v:0","-map","1:a:0",
         "-vf", vf,
-        "-r","30","-c:v","libx264","-preset","veryfast","-crf","21",
-        "-c:a","aac","-b:a","128k","-ar","48000","-ac","2",
+        "-r","30",
+        "-c:v","libx264","-preset","veryfast","-crf","21",
+        "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
         "-movflags","+faststart",
         str(outfile)
     ]
@@ -194,6 +207,7 @@ def write_concat_list(filelist_path, parts):
             f.write(f"file {shlex.quote(str(p))}\n")
 
 def concat_files(filelist_path, output_path):
+    # Since all clips are identical codecs/params, we can stream-copy for speed.
     cmd = [
         "ffmpeg","-y","-f","concat","-safe","0",
         "-i", str(filelist_path),
@@ -226,6 +240,7 @@ def main():
     Path("downloads").mkdir(exist_ok=True)
     Path("clips").mkdir(exist_ok=True)
 
+    # Try manifest first if requested
     manifest = read_manifest(PREFIX) if SORT_MODE == "manifest" else None
 
     if manifest:
@@ -238,7 +253,7 @@ def main():
             sys.exit(1)
         if SORT_MODE == "name":
             objects.sort(key=lambda x: x["Key"].lower())
-        else:  # last_modified
+        else:
             objects.sort(key=lambda x: x["LastModified"])
         ordered = [{"Key": o["Key"], "Display": ""} for o in objects]
         print(f"Found {len(ordered)} videos")
@@ -262,7 +277,7 @@ def main():
     final_parts = []
     if TITLE_TEXT:
         title_path = Path("clips") / "000-title.mp4"
-        print("\nCreating title card...")
+        print("\nCreating title card with silent audio...")
         make_title_card(title_path, TITLE_TEXT)
         final_parts.append(title_path)
 
