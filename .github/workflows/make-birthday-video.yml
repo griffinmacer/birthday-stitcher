@@ -1,0 +1,67 @@
+name: Make the Birthday Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "R2 prefix (folder inside your bucket), e.g. uploads/ or uploads/sister-40/"
+        required: true
+        default: "uploads/"
+      output_key:
+        description: "Final MP4 path in R2 (folder+file), e.g. finals/Happy40.mp4 (leave blank to auto-name)"
+        required: false
+        default: ""
+      sort_mode:
+        description: "manifest | name | last_modified"
+        required: false
+        default: "last_modified"
+      title_text:
+        description: "Optional big title on a 3s intro card (leave blank to skip)"
+        required: false
+        default: "Happy 40th, SISTER NAME!"
+      label_clips:
+        description: "Show a name label for first 3s of each clip? (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg & fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Stitch videos
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_PREFIX: ${{ github.event.inputs.prefix }}
+          OUTPUT_KEY: ${{ github.event.inputs.output_key }}
+          SORT_MODE: ${{ github.event.inputs.sort_mode }}
+          TITLE_TEXT: ${{ github.event.inputs.title_text }}
+          LABEL_CLIPS: ${{ github.event.inputs.label_clips }}
+          GENERATE_PRESIGNED_URL: "true"
+        run: python scripts/stitch_r2_videos.py
+
+      - name: Upload logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            filelist.txt
