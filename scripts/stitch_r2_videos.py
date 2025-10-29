@@ -17,7 +17,6 @@ BUCKET = os.environ["R2_BUCKET"]
 PREFIX = os.getenv("R2_PREFIX", "").strip()         # e.g., "uploads/" or "uploads/sister-40/"
 OUTPUT_KEY = os.getenv("OUTPUT_KEY", "").strip()    # e.g., "finals/Happy40.mp4"
 SORT_MODE = os.getenv("SORT_MODE", "last_modified") # "manifest" | "name" | "last_modified"
-TITLE_TEXT = os.getenv("TITLE_TEXT", "").strip()    # non-empty => add an intro card
 LABEL_CLIPS = os.getenv("LABEL_CLIPS", "false").lower() == "true"  # add name label first 3s
 GEN_PRESIGNED = os.getenv("GENERATE_PRESIGNED_URL", "false").lower() == "true"
 
@@ -121,7 +120,7 @@ def download_to(path, key):
 def transcode_to_uniform(infile, outfile, label_text=""):
     """
     Re-encode each clip to identical spec so concat is reliable:
-      - 1920x1080 canvas, keep aspect (scale & pad), yuv420p
+      - 1080x1920 portrait canvas, keep aspect (scale & pad), yuv420p
       - 30 fps
       - H.264 (libx264) CRF 21, veryfast
       - AAC 192k, 48kHz, stereo
@@ -133,10 +132,10 @@ def transcode_to_uniform(infile, outfile, label_text=""):
     meta = ffprobe_json(infile)
     has_audio = has_audio_stream(meta)
 
-    # Safe scale: fit inside 1920x1080 (portrait gets pillars, landscape gets letterbox if needed)
+    # Safe scale: fit inside 1080x1920 portrait canvas (landscape clips letterbox)
     vf_parts = []
-    vf_parts.append("scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2")
-    vf_parts.append("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black")
+    vf_parts.append("scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2")
+    vf_parts.append("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black")
     vf_parts.append("setsar=1")
     vf_parts.append("format=yuv420p")
 
@@ -183,32 +182,6 @@ def transcode_to_uniform(infile, outfile, label_text=""):
             "-movflags","+faststart",
             str(outfile)
         ]
-    run(cmd)
-
-def make_title_card(outfile, text):
-    # 3-second black card with centered big text + SILENT AUDIO so concat keeps audio streams
-    font = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    safe = ff_esc(text)
-    vf = (
-        f"drawtext=fontfile='{font}':"
-        f"text='{safe}':x=(w-text_w)/2:y=(h-text_h)/2:"
-        f"fontsize=84:fontcolor=white:box=1:boxcolor=black@0.35:boxborderw=35"
-    )
-    cmd = [
-        # video source (3s black)
-        "ffmpeg","-y",
-        "-f","lavfi","-i","color=c=black:s=1920x1080:r=30:d=3",
-        # audio source (3s silence)
-        "-f","lavfi","-i","anullsrc=channel_layout=stereo:sample_rate=48000",
-        "-t","3","-shortest",
-        "-map","0:v:0","-map","1:a:0",
-        "-vf", vf,
-        "-r","30",
-        "-c:v","libx264","-preset","veryfast","-crf","21",
-        "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
-        "-movflags","+faststart",
-        str(outfile)
-    ]
     run(cmd)
 
 def write_concat_list(filelist_path, parts):
@@ -272,13 +245,10 @@ def reorder_clips(ordered):
     return result
 
 def make_image_slide(image_path, outfile, duration=INTRO_SLIDE_DURATION):
-    """
-    Turn a still image into a short 1920x1080 clip with silent audio so
-    it can concatenate cleanly with the other parts.
-    """
+    """Create a short 1080x1920 clip from a still image with silent audio."""
     vf = ",".join([
-        "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2",
-        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black",
+        "scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
         "setsar=1",
         "format=yuv420p"
     ])
@@ -346,12 +316,6 @@ def main():
             bar.update(1)
 
     final_parts = []
-    if TITLE_TEXT:
-        title_path = Path("clips") / "000-title.mp4"
-        print("\nCreating title card with silent audio...")
-        make_title_card(title_path, TITLE_TEXT)
-        final_parts.append(title_path)
-
     # Create intro/outro slide from the specified image.
     intro_key = f"{PREFIX}{INTRO_IMAGE_NAME}"
     intro_image_path = Path("downloads") / INTRO_IMAGE_NAME
