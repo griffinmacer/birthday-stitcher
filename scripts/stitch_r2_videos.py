@@ -4,6 +4,7 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from tqdm import tqdm
 
 # ---------- READ CONFIG FROM ENV (set via GitHub Actions) ----------
@@ -19,6 +20,15 @@ SORT_MODE = os.getenv("SORT_MODE", "last_modified") # "manifest" | "name" | "las
 TITLE_TEXT = os.getenv("TITLE_TEXT", "").strip()    # non-empty => add an intro card
 LABEL_CLIPS = os.getenv("LABEL_CLIPS", "false").lower() == "true"  # add name label first 3s
 GEN_PRESIGNED = os.getenv("GENERATE_PRESIGNED_URL", "false").lower() == "true"
+
+INTRO_IMAGE_NAME = "intro-image.png"
+INTRO_SLIDE_DURATION = float(os.getenv("INTRO_SLIDE_DURATION_SECONDS", "5"))
+FIRST_VIDEO_ORDER = [
+    "max-2025-10-23_16-40-07.mov",
+    "hayes-2025-10-23_16-41-10.mov",
+    "mace-2025-10-23_16-40-44.mov",
+]
+LAST_VIDEO_NAME = "mom-and-dad-2025-10-28_23-26-34.mov"
 
 # ---------- R2 S3-COMPATIBLE CLIENT ----------
 ENDPOINT_URL = f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -230,6 +240,64 @@ def normalize_prefix(pfx: str, bucket: str) -> str:
         pfx += "/"
     return pfx
 
+def match_key_by_name(items, filename):
+    for idx, item in enumerate(items):
+        if Path(item["Key"]).name == filename:
+            return idx, item
+    return None, None
+
+def reorder_clips(ordered):
+    working = list(ordered)
+    result = []
+
+    # Ensure the first three clips appear in the desired order.
+    for expected in FIRST_VIDEO_ORDER:
+        idx, item = match_key_by_name(working, expected)
+        if item is None:
+            print(f"Required video '{expected}' not found in the input set.", file=sys.stderr)
+            sys.exit(1)
+        result.append(item)
+        working.pop(idx)
+
+    # Ensure the final clip is set aside.
+    idx, last_item = match_key_by_name(working, LAST_VIDEO_NAME)
+    if last_item is None:
+        print(f"Required final video '{LAST_VIDEO_NAME}' not found in the input set.", file=sys.stderr)
+        sys.exit(1)
+    working.pop(idx)
+
+    # Remaining clips can stay in the existing order.
+    result.extend(working)
+    result.append(last_item)
+    return result
+
+def make_image_slide(image_path, outfile, duration=INTRO_SLIDE_DURATION):
+    """
+    Turn a still image into a short 1920x1080 clip with silent audio so
+    it can concatenate cleanly with the other parts.
+    """
+    vf = ",".join([
+        "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black",
+        "setsar=1",
+        "format=yuv420p"
+    ])
+    cmd = [
+        "ffmpeg","-y","-nostdin",
+        "-loop","1","-i", str(image_path),
+        "-f","lavfi","-i","anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-t", f"{duration}",
+        "-shortest",
+        "-map","0:v:0","-map","1:a:0",
+        "-vf", vf,
+        "-r","30",
+        "-c:v","libx264","-preset","veryfast","-crf","21",
+        "-c:a","aac","-b:a","192k","-ar","48000","-ac","2",
+        "-movflags","+faststart",
+        str(outfile)
+    ]
+    run(cmd)
+
 def main():
     global PREFIX, OUTPUT_KEY
     PREFIX = normalize_prefix(PREFIX, BUCKET)
@@ -258,6 +326,9 @@ def main():
         ordered = [{"Key": o["Key"], "Display": ""} for o in objects]
         print(f"Found {len(ordered)} videos")
 
+    if ordered:
+        ordered = reorder_clips(ordered)
+
     parts = []
     with tqdm(total=len(ordered), desc="Transcoding clips") as bar:
         for idx, item in enumerate(ordered, start=1):
@@ -281,7 +352,23 @@ def main():
         make_title_card(title_path, TITLE_TEXT)
         final_parts.append(title_path)
 
+    # Create intro/outro slide from the specified image.
+    intro_key = f"{PREFIX}{INTRO_IMAGE_NAME}"
+    intro_image_path = Path("downloads") / INTRO_IMAGE_NAME
+    intro_clip_path = Path("clips") / "000-intro-image.mp4"
+    print(f"\nDownloading intro/outro image: s3://{BUCKET}/{intro_key}")
+    try:
+        download_to(intro_image_path, intro_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        print(f"Failed to download required intro image '{intro_key}' (code: {code}).", file=sys.stderr)
+        raise
+    print("Creating intro/outro slide clip...")
+    make_image_slide(intro_image_path, intro_clip_path)
+
+    final_parts.append(intro_clip_path)
     final_parts.extend(parts)
+    final_parts.append(intro_clip_path)
 
     filelist = Path("filelist.txt")
     write_concat_list(filelist, final_parts)
